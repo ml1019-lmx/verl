@@ -50,9 +50,10 @@ class MessageQueue:
         # Asyncio for message handling
         self.running = True
 
-        # async safe
-        self._lock = asyncio.Lock()
-        self._consumer_condition = asyncio.Condition(self._lock)
+        # Async-safe condition for coordinating producer/consumer coroutines.
+        # We intentionally synchronize through Condition itself (instead of
+        # exposing/using its internal lock) to keep encapsulation intact.
+        self._consumer_condition = asyncio.Condition()
 
         # statistic message
         self.total_produced = 0
@@ -75,7 +76,7 @@ class MessageQueue:
         Returns:
             bool: Whether the sample was successfully put into the queue
         """
-        async with self._lock:
+        async with self._consumer_condition:
             # If queue is full, remove the oldest sample (rarely happens)
             is_drop = False
             if len(self.queue) >= self.max_queue_size:
@@ -102,7 +103,7 @@ class MessageQueue:
         Returns:
             Any: Single sample data or None if queue is closed
         """
-        async with self._lock:
+        async with self._consumer_condition:
             while len(self.queue) == 0 and self.running:
                 await self._consumer_condition.wait()
 
@@ -117,19 +118,19 @@ class MessageQueue:
 
     async def update_param_version(self, version: int):
         """Update current parameter version"""
-        async with self._lock:
+        async with self._consumer_condition:
             old_version = self.current_param_version
             self.current_param_version = version
             print(f"Parameter version updated from {old_version} to {version}")
 
     async def get_queue_size(self) -> int:
         """Get current queue length"""
-        async with self._lock:
+        async with self._consumer_condition:
             return len(self.queue)
 
     async def get_statistics(self) -> dict[str, Any]:
         """Get queue statistics"""
-        async with self._lock:
+        async with self._consumer_condition:
             return {
                 "queue_size": len(self.queue),
                 "total_produced": self.total_produced,
@@ -142,14 +143,14 @@ class MessageQueue:
 
     async def clear_queue(self):
         """Clear the queue"""
-        async with self._lock:
+        async with self._consumer_condition:
             cleared_count = len(self.queue)
             self.queue.clear()
             logger.info(f"Cleared {cleared_count} samples from queue")
 
     async def shutdown(self):
         """Shutdown the message queue"""
-        async with self._lock:
+        async with self._consumer_condition:
             self.running = False
             # Notify all waiting coroutines so they can exit
             self._consumer_condition.notify_all()
@@ -157,7 +158,7 @@ class MessageQueue:
 
     async def get_memory_usage(self) -> dict:
         """Get memory usage statistics"""
-        async with self._lock:
+        async with self._consumer_condition:
             # Estimate memory usage of samples in queue
             import sys
 
@@ -188,11 +189,11 @@ class MessageQueue:
             }
 
     async def put_validate(self, data):
-        async with self._lock:
+        async with self._consumer_condition:
             self.val_queue.append(data)
 
     async def get_validate(self):
-        async with self._lock:
+        async with self._consumer_condition:
             if self.val_queue:
                 return self.val_queue.popleft()
             else:
