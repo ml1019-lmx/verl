@@ -6,12 +6,14 @@ from copy import deepcopy
 
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 from verl import DataProto
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, apply_kl_penalty, compute_advantage
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
+from verl.workers.rollout.schemas import AsyncRolloutRequest, AsyncRolloutRequestStateEnum, TokenizationSanityCheckModeEnum
 
 from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
 
@@ -58,6 +60,75 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
         with marked_timer("update_predictor", timing_raw, "orange"):
             predictor_output = self.actor_rollout_wg.update_predictor(gen_batch, batch)
         metrics.update(reduce_metrics(predictor_output.meta_info.get("metrics", {})))
+
+    @staticmethod
+    def _pad_maybe_mrope(tensors: list[torch.Tensor], pad_value: int = 0) -> torch.Tensor:
+        if not tensors:
+            raise ValueError("Cannot pad an empty tensor list.")
+
+        if tensors[0].dim() == 1:
+            return pad_sequence(tensors, batch_first=True, padding_value=pad_value)
+
+        if tensors[0].dim() == 2:
+            channels = tensors[0].shape[0]
+            max_len = max(t.shape[-1] for t in tensors)
+            padded = torch.full((len(tensors), channels, max_len), pad_value, dtype=tensors[0].dtype)
+            for i, tensor in enumerate(tensors):
+                padded[i, :, : tensor.shape[-1]] = tensor
+            return padded
+
+        raise ValueError(f"Unsupported tensor rank for padding: {tensors[0].dim()}")
+
+    def _hydrate_gen_batch_model_inputs(self, gen_batch: DataProto) -> DataProto:
+        if {"input_ids", "attention_mask", "position_ids"}.issubset(set(gen_batch.batch.keys())):
+            return gen_batch
+
+        processing_class = self.processor if self.processor is not None else self.tokenizer
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        data_cfg = self.config.data
+        max_prompt_len = int(data_cfg.get("max_prompt_length", 8192))
+        max_response_len = int(rollout_cfg.get("response_length", 8192))
+        use_inference_chat_template = bool(rollout_cfg.get("use_inference_chat_template", True))
+        tokenization_mode = TokenizationSanityCheckModeEnum(
+            rollout_cfg.get("tokenization_sanity_check_mode", TokenizationSanityCheckModeEnum.STRICT.value)
+        )
+
+        messages_list = gen_batch.non_tensor_batch.get("messages")
+        if messages_list is None:
+            return gen_batch
+
+        tool_schemas_list = gen_batch.non_tensor_batch.get("tool_schemas")
+        multi_modal_data_list = gen_batch.non_tensor_batch.get("multi_modal_data")
+
+        input_ids_list: list[torch.Tensor] = []
+        attention_mask_list: list[torch.Tensor] = []
+        position_ids_list: list[torch.Tensor] = []
+        for i, messages in enumerate(messages_list):
+            request = AsyncRolloutRequest.model_validate(
+                {
+                    "batch_data_id": i,
+                    "rollout_offset": 0,
+                    "request_id": f"predictor-{i}",
+                    "state": AsyncRolloutRequestStateEnum.PENDING,
+                    "messages": messages,
+                    "tool_schemas": tool_schemas_list[i] if tool_schemas_list is not None else None,
+                    "multi_modal_data": multi_modal_data_list[i] if multi_modal_data_list is not None else None,
+                    "reward_scores": {},
+                    "max_prompt_len": max_prompt_len,
+                    "max_response_len": max_response_len,
+                    "use_inference_chat_template": use_inference_chat_template,
+                    "tokenization_sanity_check_mode": tokenization_mode,
+                    "processing_class": processing_class,
+                }
+            )
+            input_ids_list.append(request.input_ids.squeeze(0))
+            attention_mask_list.append(request.attention_mask.squeeze(0))
+            position_ids_list.append(request.position_ids.squeeze(0))
+
+        gen_batch.batch["input_ids"] = self._pad_maybe_mrope(input_ids_list, pad_value=self.tokenizer.pad_token_id)
+        gen_batch.batch["attention_mask"] = self._pad_maybe_mrope(attention_mask_list, pad_value=0)
+        gen_batch.batch["position_ids"] = self._pad_maybe_mrope(position_ids_list, pad_value=0)
+        return gen_batch
 
     def fit(self):
         if not self._predictor_enabled():
@@ -121,6 +192,7 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
                 new_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                 gen_batch = self._get_gen_batch(new_batch)
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                gen_batch = self._hydrate_gen_batch_model_inputs(gen_batch)
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
