@@ -42,6 +42,7 @@ from verl.utils.device import get_device_id, is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+from verl.workers.rollout.vllm_rollout.pd_utils import vllm_pd_role_for_rank, vllm_pd_world_size
 from verl.workers.rollout.vllm_rollout.utils import get_device_uuid
 
 logger = logging.getLogger(__file__)
@@ -76,17 +77,29 @@ class ServerAdapter(BaseRollout):
 
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
-        rollout_world_size = (
-            self.config.tensor_model_parallel_size
-            * self.config.data_parallel_size
-            * self.config.pipeline_model_parallel_size
-        )
+        self._pd_enabled = bool(getattr(self.config.disaggregation, "enabled", False))
+        if self._pd_enabled:
+            rollout_world_size = vllm_pd_world_size(self.config)
+        else:
+            rollout_world_size = (
+                self.config.tensor_model_parallel_size
+                * self.config.data_parallel_size
+                * self.config.pipeline_model_parallel_size
+            )
         if replica_rank == -1:
             self.replica_rank = rank // rollout_world_size
         else:
             self.replica_rank = replica_rank
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
+        self._pd_role: Optional[str] = None
+        self._pd_server_index = 0
+        self._pd_tp_local_rank = self.rollout_rank % local_world_size
+        if self._pd_enabled:
+            self._pd_role, self._pd_server_index, self._pd_tp_local_rank = vllm_pd_role_for_rank(
+                self.config, self.rollout_rank
+            )
+            self.node_rank = 0
 
         if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
@@ -103,7 +116,7 @@ class ServerAdapter(BaseRollout):
         # multiple replicas share a node, and the Ray job id so two independent
         # verl jobs on the same host (or a new run after a crashed one with a
         # stale socket file) cannot collide on the shared /tmp namespace.
-        local_rank = self.rollout_rank % local_world_size
+        local_rank = self._pd_tp_local_rank if self._pd_enabled else self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
@@ -136,13 +149,12 @@ class ServerAdapter(BaseRollout):
         Returns:
             The result of the method execution, or None if non_block=True.
         """
-        if self.rollout_rank != 0:
+        if not self._is_server_tp_leader():
             return None
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            prefix = self._get_server_name_prefix()
-            self.server_handle = ray.get_actor(f"{prefix}server_{self.replica_rank}_{self.node_rank}")
+            self.server_handle = ray.get_actor(self._get_server_actor_name())
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
@@ -186,17 +198,31 @@ class ServerAdapter(BaseRollout):
             await future
 
         # reset prefix cache after updating weights
-        if self.rollout_rank == 0:
+        if self._is_server_tp_leader():
             await self.server_handle.clear_kv_cache.remote()
             if global_steps is not None:
                 await self.server_handle.set_global_steps.remote(global_steps)
 
-        if self.replica_rank == 0 and self.rollout_rank == 0:
+        if self.replica_rank == 0 and self._is_server_tp_leader():
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""
         return f"{self.config.get('name', 'vllm')}_"
+
+    def _is_server_tp_leader(self) -> bool:
+        """Return whether this rank should issue control RPCs for its server."""
+        if self._pd_enabled:
+            return self._pd_tp_local_rank == 0
+        return self.rollout_rank == 0
+
+    def _get_server_actor_name(self) -> str:
+        prefix = self._get_server_name_prefix()
+        if not self._pd_enabled:
+            return f"{prefix}server_{self.replica_rank}_{self.node_rank}"
+        if self._pd_role == "prefill":
+            return f"{prefix}server_{self.replica_rank}_0"
+        return f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.

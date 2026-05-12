@@ -28,6 +28,9 @@ def test_disaggregation_defaults_disabled_and_valid():
     assert cfg.transfer_backend == "nixl"
     assert cfg.bootstrap_port is None
     assert cfg.ib_device is None
+    assert cfg.kv_connector == "MooncakeConnectorV1"
+    assert cfg.kv_port is None
+    assert cfg.kv_port_stride == 128
 
 
 def test_disaggregation_enabled_nixl_accepted():
@@ -71,11 +74,59 @@ def test_rollout_config_sglang_with_disagg_enabled_ok():
     assert cfg.disaggregation.enabled is True
 
 
-@pytest.mark.parametrize("name", ["vllm", "trtllm"])
-def test_rollout_config_non_sglang_rejects_pd(name):
+def test_rollout_config_vllm_with_disagg_enabled_ok():
+    cfg = RolloutConfig(
+        name="vllm",
+        tensor_model_parallel_size=2,
+        disaggregation=DisaggregationConfig(
+            enabled=True,
+            transfer_backend="mooncake",
+            decode_replicas=2,
+            decode_tensor_model_parallel_size=1,
+        ),
+    )
+    assert cfg.disaggregation.enabled is True
+    assert cfg.disaggregation.kv_connector == "MooncakeConnectorV1"
+    assert cfg.disaggregation.kv_port is None
+    assert cfg.disaggregation.kv_port_stride == 128
+
+
+def test_rollout_config_vllm_pd_rejects_non_mooncake_backend():
+    with pytest.raises(ValueError, match="vLLM PD.*transfer_backend='mooncake'"):
+        RolloutConfig(
+            name="vllm",
+            disaggregation=DisaggregationConfig(enabled=True, transfer_backend="nixl"),
+        )
+
+
+def test_rollout_config_vllm_pd_rejects_dp_pp_and_multi_prefill():
+    with pytest.raises(NotImplementedError, match="data_parallel_size=1"):
+        RolloutConfig(
+            name="vllm",
+            data_parallel_size=2,
+            disaggregation=DisaggregationConfig(enabled=True, transfer_backend="mooncake"),
+        )
+    with pytest.raises(NotImplementedError, match="pipeline_model_parallel_size=1"):
+        RolloutConfig(
+            name="vllm",
+            pipeline_model_parallel_size=2,
+            disaggregation=DisaggregationConfig(enabled=True, transfer_backend="mooncake"),
+        )
+    with pytest.raises(NotImplementedError, match="prefill_replicas=1"):
+        RolloutConfig(
+            name="vllm",
+            disaggregation=DisaggregationConfig(
+                enabled=True,
+                transfer_backend="mooncake",
+                prefill_replicas=2,
+            ),
+        )
+
+
+def test_rollout_config_trtllm_rejects_pd():
     with pytest.raises(ValueError, match="disaggregation.enabled=True"):
         RolloutConfig(
-            name=name,
+            name="trtllm",
             disaggregation=DisaggregationConfig(enabled=True),
         )
 
@@ -127,17 +178,53 @@ def test_dispatch_non_sglang_with_flag_raises():
     from verl.workers.rollout.replica import get_rollout_replica_class
 
     with pytest.raises(NotImplementedError, match="PD disaggregation"):
-        get_rollout_replica_class("vllm", disaggregation_enabled=True)
+        get_rollout_replica_class("trtllm", disaggregation_enabled=True)
 
 
-def _assign_pd_role(rollout_rank: int, prefill_tp: int, decode_replicas: int, decode_tp: int):
-    """Mirror of ServerAdapter.__init__'s role-assignment block."""
-    if rollout_rank < prefill_tp:
-        return "prefill", 0, rollout_rank
-    off = rollout_rank - prefill_tp
-    if off < decode_replicas * decode_tp:
-        return "decode", off // decode_tp, off % decode_tp
-    return None, None, None
+def test_dispatch_vllm_returns_pd_replica_when_flag_set():
+    from verl.workers.rollout.replica import get_rollout_replica_class
+
+    pd_cls = get_rollout_replica_class("vllm", disaggregation_enabled=True)
+    assert pd_cls.__name__ == "vLLMPDReplica"
+
+
+def test_vllm_pd_world_size_and_ports():
+    from verl.workers.rollout.vllm_rollout.pd_utils import (
+        build_vllm_pd_kv_transfer_config,
+        resolve_vllm_pd_decode_tp,
+        resolve_vllm_pd_kv_port,
+        vllm_pd_world_size,
+    )
+
+    cfg = RolloutConfig(
+        name="vllm",
+        tensor_model_parallel_size=4,
+        disaggregation=DisaggregationConfig(
+            enabled=True,
+            transfer_backend="mooncake",
+            decode_replicas=2,
+            decode_tensor_model_parallel_size=2,
+            kv_port=23010,
+            kv_port_stride=64,
+        ),
+    )
+
+    assert resolve_vllm_pd_decode_tp(cfg) == 2
+    assert vllm_pd_world_size(cfg) == 8
+    assert resolve_vllm_pd_kv_port(cfg, pd_server_index=0) == 23010
+    assert resolve_vllm_pd_kv_port(cfg, pd_server_index=1) == 23074
+
+    producer = build_vllm_pd_kv_transfer_config(cfg, role="prefill", pd_server_index=0)
+    consumer = build_vllm_pd_kv_transfer_config(cfg, role="decode", pd_server_index=1)
+    assert producer["kv_connector"] == "MooncakeConnectorV1"
+    assert producer["kv_role"] == "kv_producer"
+    assert producer["kv_buffer_device"] == "npu"
+    assert producer["kv_connector_extra_config"] == {
+        "prefill": {"dp_size": 1, "tp_size": 4},
+        "decode": {"dp_size": 1, "tp_size": 2},
+    }
+    assert consumer["kv_role"] == "kv_consumer"
+    assert consumer["kv_port"] == 23074
 
 
 @pytest.mark.parametrize(
@@ -158,15 +245,39 @@ def _assign_pd_role(rollout_rank: int, prefill_tp: int, decode_replicas: int, de
     ],
 )
 def test_pd_role_assignment(prefill_tp, decode_replicas, decode_tp, rollout_rank, expected):
-    assert _assign_pd_role(rollout_rank, prefill_tp, decode_replicas, decode_tp) == expected
+    from verl.workers.rollout.vllm_rollout.pd_utils import vllm_pd_role_for_rank
+
+    cfg = RolloutConfig(
+        name="vllm",
+        tensor_model_parallel_size=prefill_tp,
+        disaggregation=DisaggregationConfig(
+            enabled=True,
+            transfer_backend="mooncake",
+            decode_replicas=decode_replicas,
+            decode_tensor_model_parallel_size=decode_tp,
+        ),
+    )
+    assert vllm_pd_role_for_rank(cfg, rollout_rank) == expected
 
 
 @pytest.mark.parametrize("prefill_tp,decode_replicas,decode_tp", [(1, 3, 1), (1, 7, 1), (2, 3, 2), (1, 1, 4)])
 def test_pd_role_covers_every_rank_exactly_once(prefill_tp, decode_replicas, decode_tp):
+    from verl.workers.rollout.vllm_rollout.pd_utils import vllm_pd_role_for_rank
+
+    cfg = RolloutConfig(
+        name="vllm",
+        tensor_model_parallel_size=prefill_tp,
+        disaggregation=DisaggregationConfig(
+            enabled=True,
+            transfer_backend="mooncake",
+            decode_replicas=decode_replicas,
+            decode_tensor_model_parallel_size=decode_tp,
+        ),
+    )
     world = prefill_tp + decode_replicas * decode_tp
     seen: set[tuple[str, int, int]] = set()
     for rr in range(world):
-        role, srv, tp_rank = _assign_pd_role(rr, prefill_tp, decode_replicas, decode_tp)
+        role, srv, tp_rank = vllm_pd_role_for_rank(cfg, rr)
         assert role is not None, f"rollout_rank={rr} got no role"
         seen.add((role, srv, tp_rank))
     assert len(seen) == world, "each rank must map to a distinct (role, server_index, tp_local_rank) triple"

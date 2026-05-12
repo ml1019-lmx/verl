@@ -322,7 +322,18 @@ class RolloutConfig(BaseConfig):
                     f"tensor_model_parallel_size={self.tensor_model_parallel_size})"
                 )
 
+        raw_disaggregation_enabled = (
+            self.disaggregation.get("enabled", False)
+            if isinstance(self.disaggregation, dict)
+            else getattr(self.disaggregation, "enabled", False)
+        )
+
         if self.pipeline_model_parallel_size > 1:
+            if raw_disaggregation_enabled and self.name == "vllm":
+                raise NotImplementedError(
+                    "vLLM PD disaggregation currently requires pipeline_model_parallel_size=1 "
+                    f"(got {self.pipeline_model_parallel_size})."
+                )
             if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
@@ -346,8 +357,33 @@ class RolloutConfig(BaseConfig):
                 DisaggregationConfig(**OmegaConf.to_container(self.disaggregation, resolve=True)),
             )
 
-        if self.disaggregation.enabled and self.name != "sglang":
+        if self.disaggregation.enabled:
+            if self.name == "sglang":
+                return
+            if self.name == "vllm":
+                if self.disaggregation.transfer_backend != "mooncake":
+                    raise ValueError(
+                        "vLLM PD disaggregation currently requires "
+                        f"disaggregation.transfer_backend='mooncake'; got "
+                        f"{self.disaggregation.transfer_backend!r}."
+                    )
+                if self.data_parallel_size != 1:
+                    raise NotImplementedError(
+                        "vLLM PD disaggregation currently requires data_parallel_size=1 "
+                        f"(got {self.data_parallel_size})."
+                    )
+                if self.pipeline_model_parallel_size != 1:
+                    raise NotImplementedError(
+                        "vLLM PD disaggregation currently requires pipeline_model_parallel_size=1 "
+                        f"(got {self.pipeline_model_parallel_size})."
+                    )
+                if self.disaggregation.prefill_replicas != 1:
+                    raise NotImplementedError(
+                        "vLLM PD disaggregation currently requires prefill_replicas=1 "
+                        f"(got {self.disaggregation.prefill_replicas})."
+                    )
+                return
             raise ValueError(
-                f"rollout.disaggregation.enabled=True is currently only supported with "
-                f"rollout.name='sglang'; got {self.name!r}. (vLLM PD is a tracked follow-up.)"
+                f"rollout.disaggregation.enabled=True is only supported with "
+                f"rollout.name='sglang' or rollout.name='vllm'; got {self.name!r}."
             )

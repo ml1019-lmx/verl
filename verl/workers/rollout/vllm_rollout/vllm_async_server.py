@@ -43,6 +43,7 @@ from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.vllm_rollout.pd_utils import build_vllm_pd_kv_transfer_config
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -95,6 +96,10 @@ class vLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        disaggregation_role: str = "null",
+        pd_server_index: int = 0,
+        pd_prefill_tp: Optional[int] = None,
+        pd_decode_tp: Optional[int] = None,
     ):
         """
         Args:
@@ -130,6 +135,14 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        if disaggregation_role not in ("null", "prefill", "decode"):
+            raise ValueError(f"Unsupported vLLM disaggregation_role={disaggregation_role!r}")
+        self.disaggregation_role = disaggregation_role
+        self.pd_server_index = pd_server_index
+        self.pd_prefill_tp = pd_prefill_tp
+        self.pd_decode_tp = pd_decode_tp
+        self._pd_decode_peers: list[ActorHandle] = []
+        self._pd_next_decode_index = 0
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -177,6 +190,12 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    async def set_pd_peer(self, decode_peers: list[ActorHandle]):
+        """Set decode peers used by a prefill server in vLLM PD mode."""
+        if self.disaggregation_role != "prefill":
+            raise ValueError("Only vLLM PD prefill server can accept decode peers.")
+        self._pd_decode_peers = list(decode_peers)
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -353,6 +372,21 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
+        if self.disaggregation_role != "null":
+            if not is_torch_npu_available(check_device=False):
+                raise NotImplementedError("vLLM PD disaggregation is NPU/vLLM-Ascend only.")
+            # Importing the module registers vLLM-Ascend KV connectors with vLLM.
+            import vllm_ascend.distributed.kv_transfer  # noqa: F401
+
+            args["kv_transfer_config"] = json.dumps(
+                build_vllm_pd_kv_transfer_config(
+                    self.config,
+                    role=self.disaggregation_role,
+                    pd_server_index=self.pd_server_index,
+                    engine_id=f"{self.disaggregation_role}-{self.replica_rank}-{self.pd_server_index}",
+                )
+            )
+
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:
@@ -451,8 +485,39 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        kv_transfer_params: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        sampling_params = dict(sampling_params)
+        if self.disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
+            decode_peer = self._pd_decode_peers[self._pd_next_decode_index % len(self._pd_decode_peers)]
+            self._pd_next_decode_index += 1
+
+            prefill_sampling_params = dict(sampling_params)
+            prefill_sampling_params["max_tokens"] = 1
+            prefill_output = await self.generate(
+                prompt_ids=prompt_ids,
+                sampling_params=prefill_sampling_params,
+                request_id=f"{request_id}:prefill",
+                image_data=image_data,
+                video_data=video_data,
+                priority=priority,
+                kv_transfer_params={"do_remote_decode": True, "do_remote_prefill": False},
+            )
+            remote_kv_transfer_params = prefill_output.extra_fields.get("kv_transfer_params")
+            if not remote_kv_transfer_params:
+                raise RuntimeError("vLLM PD prefill did not return kv_transfer_params for remote decode.")
+
+            return await decode_peer.generate.remote(
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                request_id=f"{request_id}:decode",
+                image_data=image_data,
+                video_data=video_data,
+                priority=priority,
+                kv_transfer_params=remote_kv_transfer_params,
+            )
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -486,6 +551,10 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        if kv_transfer_params is not None:
+            extra_args = dict(sampling_params.pop("extra_args", {}) or {})
+            extra_args["kv_transfer_params"] = dict(kv_transfer_params)
+            sampling_params["extra_args"] = extra_args
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -532,6 +601,8 @@ class vLLMHttpServer:
             )
 
         extra_fields = {"global_steps": self.global_steps}
+        if getattr(final_res, "kv_transfer_params", None) is not None:
+            extra_fields["kv_transfer_params"] = final_res.kv_transfer_params
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,

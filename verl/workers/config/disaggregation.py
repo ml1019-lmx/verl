@@ -23,7 +23,7 @@ _ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")
 
 @dataclass
 class DisaggregationConfig(BaseConfig):
-    """Prefill-Decode disaggregation knobs (SGLang only)."""
+    """Prefill-Decode disaggregation knobs (SGLang/vLLM)."""
 
     enabled: bool = False
     prefill_replicas: int = 1
@@ -32,6 +32,9 @@ class DisaggregationConfig(BaseConfig):
     transfer_backend: str = "nixl"
     bootstrap_port: Optional[int] = None
     ib_device: Optional[str] = None
+    kv_connector: str = "MooncakeConnectorV1"
+    kv_port: Optional[int] = None
+    kv_port_stride: int = 128
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -45,6 +48,10 @@ class DisaggregationConfig(BaseConfig):
             )
         if self.bootstrap_port is not None and not (0 < self.bootstrap_port < 65536):
             raise ValueError(f"bootstrap_port out of range: {self.bootstrap_port}")
+        if self.kv_port is not None and not (0 < self.kv_port < 65536):
+            raise ValueError(f"kv_port out of range: {self.kv_port}")
+        if self.kv_port_stride <= 0:
+            raise ValueError(f"kv_port_stride must be positive, got {self.kv_port_stride}")
 
     def effective_decode_tp(self, prefill_tp: int) -> int:
         """Resolve decode TP (defaults to ``prefill_tp``). Test-only helper; runtime paths
